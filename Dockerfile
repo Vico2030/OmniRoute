@@ -1,5 +1,18 @@
 # ── Common base with runtime deps ──────────────────────────────────────────
-FROM node:24-trixie-slim AS base
+# Pinned (not floating `node:24-trixie-slim`): Node 24.19.0 has an upstream,
+# unmerged core regression (nodejs/node#65195, use-after-free in
+# CleanupHookThunkRun, introduced by #63642) that aborts the process with
+# `Assertion failed: (env) != nullptr` in RemoveEnvironmentCleanupHook when
+# any node::ObjectWrap-based native addon (e.g. better-sqlite3's Database/
+# Statement classes) is still alive at environment/worker teardown. This is
+# exactly what crashed `npm run build`'s "Collecting page data" step here
+# (real crash: docs/omniroute-preservation/2026-08-15-gemini-embeddings-dimension-fix/
+# build_and_recreate.20260817T121146Z.log). Reproduced offline on 24.19.0
+# (5/5 crashes) and confirmed absent on 24.18.0 (8/8 clean runs) — the last
+# Node 24.x patch before the regression landed. Re-float to `node:24-trixie-slim`
+# only after nodejs/node#65196 (or an equivalent fix) ships in a released
+# Node 24.x patch.
+FROM node:24.18.0-trixie-slim AS base
 WORKDIR /app
 
 # `apt-get upgrade` pulls the security-patched versions of the Debian (trixie)
