@@ -31,6 +31,7 @@ import { resolveEndpointCategory } from "@/shared/constants/endpointCategories";
 import { resolveQuotaKeyScope } from "@/lib/quota/quotaKey";
 import { isQuotaModelName, parseQuotaModelName } from "@/lib/quota/quotaModelNaming";
 import { buildApiKeyUsageLimitPolicyRejection } from "@/lib/usage/apiKeyUsageLimits";
+import { isRecognizedBuiltinAuto } from "@omniroute/open-sse/services/autoCombo/builtinCatalog";
 
 // Default to no per-key request cap. API keys can still opt into explicit
 // limits via Settings/API Keys, while provider/account quota controls remain
@@ -186,6 +187,12 @@ function matchesComboAccessRule(comboName: string, requestedModel: string, rule:
     rule === requestedModel ||
     `combo/${normalizedRule}` === requestedModel
   );
+}
+
+function resolveBuiltinAutoComboName(modelStr: string): string | null {
+  if (!modelStr.startsWith("auto/")) return null;
+  const suffix = modelStr.slice("auto/".length);
+  return isRecognizedBuiltinAuto(modelStr, suffix) ? modelStr : null;
 }
 
 function isAnthropicMessagesRequest(request: Request): boolean {
@@ -514,8 +521,35 @@ export async function enforceApiKeyPolicy(
   let requestedComboName: string | null = null;
   const isQuotaExclusive =
     Boolean(apiKeyInfo.allowedQuotas) && (apiKeyInfo.allowedQuotas as string[]).length > 0;
+
+  // Built-in auto/* routes are virtual combos and therefore have no persisted row
+  // for resolveRequestedComboName() to find. Require an explicit allowedCombos
+  // grant before the generic auto/* model-gate shortcut below. This is deliberately
+  // deny-by-default even when allowedCombos is empty: physical-model policy keeps
+  // its existing semantics, while virtual logical routes require an affirmative grant.
+  const builtinAutoComboName =
+    !isQuotaExclusive && modelStr ? resolveBuiltinAutoComboName(modelStr) : null;
+  if (builtinAutoComboName) {
+    const allowedCombos = apiKeyInfo.allowedCombos || [];
+    const allowed = allowedCombos.some((rule) =>
+      matchesComboAccessRule(builtinAutoComboName, modelStr, rule)
+    );
+    if (!allowed) {
+      return {
+        apiKey,
+        apiKeyInfo,
+        rejection: errorResponse(
+          HTTP_STATUS.FORBIDDEN,
+          `Combo "${builtinAutoComboName}" is not allowed for this API key`
+        ),
+      };
+    }
+    requestedComboName = builtinAutoComboName;
+  }
+
   if (
     !isQuotaExclusive &&
+    !requestedComboName &&
     modelStr &&
     apiKeyInfo.allowedCombos &&
     apiKeyInfo.allowedCombos.length > 0

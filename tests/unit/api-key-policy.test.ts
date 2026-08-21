@@ -607,6 +607,107 @@ test("enforceApiKeyPolicy enforces combo allowlists separately from model allowl
   assert.equal(mapped.rejection, null);
 });
 
+// SR-GATE-1: built-in auto/* routes are logical routes even though they do not
+// have persisted combo rows. They must use the same explicit allowedCombos gate
+// as stored combos; allowedModels must continue to govern direct physical IDs.
+test("SR-GATE-1 rejects an unauthorized built-in auto route", async () => {
+  const emptyKey = await createKeyWithPolicy({
+    allowedModels: ["groq/openai/gpt-oss-120b"],
+    allowedCombos: [],
+  });
+  const unrelatedKey = await createKeyWithPolicy({
+    allowedModels: ["groq/openai/gpt-oss-120b"],
+    allowedCombos: ["stored-general"],
+  });
+  const policy = await loadPolicy("sr-gate-auto-denied");
+
+  for (const key of [emptyKey, unrelatedKey]) {
+    const result = await policy.enforceApiKeyPolicy(makePolicyRequest(key.key), "auto/best-fast");
+    assert.equal(result.rejection?.status, 403);
+    assert.match(await readErrorMessage(result.rejection), /auto\/best-fast.*not allowed/i);
+  }
+});
+
+test("SR-GATE-1 allows an explicitly authorized built-in auto route", async () => {
+  const key = await createKeyWithPolicy({
+    allowedModels: ["groq/openai/gpt-oss-120b"],
+    allowedCombos: ["auto/best-fast"],
+  });
+  const policy = await loadPolicy("sr-gate-auto-allowed");
+
+  const result = await policy.enforceApiKeyPolicy(makePolicyRequest(key.key), "auto/best-fast");
+
+  assert.equal(result.rejection, null);
+});
+
+test("SR-GATE-1 stored combo authorization remains deny/allow explicit", async () => {
+  await combosDb.createCombo({
+    name: "stored-general",
+    strategy: "priority",
+    models: ["groq/openai/gpt-oss-120b"],
+  });
+  const deniedKey = await createKeyWithPolicy({ allowedCombos: ["stored-fast"] });
+  const allowedKey = await createKeyWithPolicy({ allowedCombos: ["stored-general"] });
+  const policy = await loadPolicy("sr-gate-stored-combo");
+
+  const denied = await policy.enforceApiKeyPolicy(
+    makePolicyRequest(deniedKey.key),
+    "combo/stored-general"
+  );
+  const allowed = await policy.enforceApiKeyPolicy(
+    makePolicyRequest(allowedKey.key),
+    "combo/stored-general"
+  );
+
+  assert.equal(denied.rejection?.status, 403);
+  assert.equal(allowed.rejection, null);
+});
+
+test("SR-GATE-1 physical model authorization remains deny/allow explicit", async () => {
+  const deniedKey = await createKeyWithPolicy({ allowedModels: ["openai/gpt-4.1"] });
+  const allowedKey = await createKeyWithPolicy({ allowedModels: ["groq/openai/gpt-oss-120b"] });
+  const policy = await loadPolicy("sr-gate-physical-model");
+
+  const denied = await policy.enforceApiKeyPolicy(
+    makePolicyRequest(deniedKey.key),
+    "groq/openai/gpt-oss-120b"
+  );
+  const allowed = await policy.enforceApiKeyPolicy(
+    makePolicyRequest(allowedKey.key),
+    "groq/openai/gpt-oss-120b"
+  );
+
+  assert.equal(denied.rejection?.status, 403);
+  assert.equal(allowed.rejection, null);
+});
+
+test("SR-GATE-1 Pulsora and CHAMKILA unrestricted physical policies remain unchanged", async () => {
+  const pulsora = await createKeyWithPolicy({});
+  const chamkila = await createKeyWithPolicy({});
+  const policy = await loadPolicy("sr-gate-pulsora-chamkila");
+
+  for (const key of [pulsora, chamkila]) {
+    const result = await policy.enforceApiKeyPolicy(makePolicyRequest(key.key), "openai/gpt-5.6");
+    assert.equal(result.rejection, null);
+  }
+});
+
+test("SR-GATE-1 Hermes physical-model fixture remains unchanged", async () => {
+  const hermes = await createKeyWithPolicy({
+    allowedModels: ["groq/openai/gpt-oss-20b", "groq/openai/gpt-oss-120b", "cerebras/gpt-oss-120b"],
+  });
+  const policy = await loadPolicy("sr-gate-hermes");
+
+  for (const model of [
+    "groq/openai/gpt-oss-20b",
+    "groq/openai/gpt-oss-120b",
+    "cerebras/gpt-oss-120b",
+  ]) {
+    const result = await policy.enforceApiKeyPolicy(makePolicyRequest(hermes.key), model);
+    assert.equal(result.rejection, null, `${model} must retain existing Hermes access`);
+  }
+});
+
 test("enforceApiKeyPolicy applies configured throttle delay", async () => {
   const delayedKey = await createKeyWithPolicy({ throttleDelayMs: 25 });
   const policy = await loadPolicy("throttle-delay");

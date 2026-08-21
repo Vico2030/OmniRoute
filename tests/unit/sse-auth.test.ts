@@ -720,6 +720,40 @@ test("getProviderCredentials intersects forcedConnectionId with allowedConnectio
   assert.equal(selected, null);
 });
 
+test("SR-GATE-1 authorized logical target may select an allowed requester connection", async () => {
+  const allowedConn = await seedConnection("openai", {
+    name: "sr-gate-allowed-target",
+    apiKey: "sk-sr-gate-allowed",
+  });
+  await seedConnection("openai", {
+    name: "sr-gate-unrelated-target",
+    apiKey: "sk-sr-gate-unrelated",
+  });
+
+  const selected = await auth.getProviderCredentials("openai", null, [allowedConn.id], "gpt-5.6", {
+    forcedConnectionId: allowedConn.id,
+  });
+
+  assert.equal(selected.connectionId, allowedConn.id);
+});
+
+test("SR-GATE-1 authorized logical target cannot force a disallowed requester connection", async () => {
+  const allowedConn = await seedConnection("openai", {
+    name: "sr-gate-requester-allowed",
+    apiKey: "sk-sr-gate-requester-allowed",
+  });
+  const disallowedConn = await seedConnection("openai", {
+    name: "sr-gate-combo-disallowed",
+    apiKey: "sk-sr-gate-combo-disallowed",
+  });
+
+  const selected = await auth.getProviderCredentials("openai", null, [allowedConn.id], "gpt-5.6", {
+    forcedConnectionId: disallowedConn.id,
+  });
+
+  assert.equal(selected, null);
+});
+
 test("getProviderCredentials retains rate-limited accounts when allowSuppressedConnections is enabled", async () => {
   const connection = await seedConnection("openai", {
     name: "suppressed-rate-limit",
