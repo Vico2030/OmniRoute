@@ -158,7 +158,16 @@ export function upsertTokenLimit(input: UpsertTokenLimitInput): TokenLimit {
                    reset_time     = excluded.reset_time,
                    enabled        = excluded.enabled,
                    updated_at     = datetime('now')`
-  ).run({ id, apiKeyId: input.apiKeyId, scopeType, scopeValue, tokenLimit, resetInterval, resetTime, enabled });
+  ).run({
+    id,
+    apiKeyId: input.apiKeyId,
+    scopeType,
+    scopeValue,
+    tokenLimit,
+    resetInterval,
+    resetTime,
+    enabled,
+  });
 
   const row = db
     .prepare(
@@ -255,6 +264,32 @@ export function getWindowUsage(limit: TokenLimit, now = Date.now()): number {
 }
 
 /**
+ * Atomically create a counter row for a window if one does not already exist.
+ * The first initializer wins; later callers observe the existing authoritative
+ * value without adding their seed again.
+ */
+export function initializeWindowTokens(
+  limitId: string,
+  windowStart: string,
+  tokens: number
+): number {
+  ensureSchema();
+  const db = getDbInstance();
+  const initial = Math.max(0, Math.floor(toNumber(tokens)));
+  db.prepare(
+    `INSERT INTO api_key_token_counters (limit_id, window_start, tokens_used, updated_at)
+     VALUES (@limitId, @windowStart, @tokens, datetime('now'))
+     ON CONFLICT(limit_id, window_start) DO NOTHING`
+  ).run({ limitId, windowStart, tokens: initial });
+  const row = db
+    .prepare(
+      "SELECT tokens_used FROM api_key_token_counters WHERE limit_id = ? AND window_start = ?"
+    )
+    .get(limitId, windowStart);
+  return toNumber(asRecord(row).tokens_used);
+}
+
+/**
  * Atomically add `tokens` to the counter for (limitId, windowStart) and return
  * the new running total. Uses UPSERT (no read-then-write) so concurrent
  * increments under WAL cannot lose updates.
@@ -281,11 +316,7 @@ export function incrementWindowTokens(
 }
 
 /** Append a window-reset audit log row. */
-export function logTokenLimitReset(
-  limitId: string,
-  prevTokens: number,
-  windowStart: string
-): void {
+export function logTokenLimitReset(limitId: string, prevTokens: number, windowStart: string): void {
   ensureSchema();
   const db = getDbInstance();
   db.prepare(

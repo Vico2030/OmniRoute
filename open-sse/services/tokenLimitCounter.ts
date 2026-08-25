@@ -16,11 +16,12 @@ import { getDbInstance } from "../../src/lib/db/core.ts";
 import {
   resetWindowIfElapsed,
   getWindowUsage,
+  initializeWindowTokens,
   incrementWindowTokens,
   getTokenLimitsForRequest,
   logTokenLimitReset,
   type TokenLimit,
-} from "@/lib/localDb";
+} from "../../src/lib/db/tokenLimits.ts";
 
 interface CacheEntry {
   windowStart: string;
@@ -112,17 +113,12 @@ export function getCurrentWindowUsage(
   // DB point-read (authoritative for the window).
   let dbUsage = getWindowUsage(limit, now);
 
-  // Cold window: no counter row yet → seed from usage_history and PERSIST the
-  // seed to the counter row so a subsequent recordTokenUsage increment does not
-  // forget the existing historical usage in this window (force-fresh read then
-  // first record must accumulate on top of history, not restart from 0).
+  // Cold window: atomically initialize a row even when history is empty. This
+  // closes the save-before-record race on the first successful request: its
+  // usage row can no longer be seeded and then added again by recordTokenUsage.
   if (dbUsage === 0 && (!cached || cached.windowStart !== windowStart)) {
     const seeded = seedWindowUsageFromHistory(limit, now);
-    if (seeded > 0) {
-      // UPSERT creates the row at `seeded`; safe because there is no row yet
-      // (dbUsage === 0). Returns the new authoritative total.
-      dbUsage = incrementWindowTokens(limit.id, windowStart, seeded);
-    }
+    dbUsage = initializeWindowTokens(limit.id, windowStart, seeded);
   }
 
   cache.set(limit.id, { windowStart, tokensUsed: dbUsage, syncedAt: now });
@@ -295,8 +291,7 @@ export function recordTokenUsage(
                  ORDER BY window_start DESC LIMIT 1`
               )
               .get(limit.id, windowStart) as
-              | { window_start?: string; tokens_used?: number }
-              | undefined;
+              { window_start?: string; tokens_used?: number } | undefined;
             const prevTokens =
               priorRow && typeof priorRow.tokens_used === "number" ? priorRow.tokens_used : 0;
             if (prevTokens > 0) {

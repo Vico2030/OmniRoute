@@ -151,7 +151,14 @@ test("seed-on-miss equals usage_history SUM for the active window", async () => 
   // Different month (excluded).
   insertUsage("k2", "openai", "gpt-4o", 999, 999, new Date(Date.UTC(2025, 11, 31)).toISOString());
   // Different model (excluded).
-  insertUsage("k2", "openai", "gpt-4o-mini", 777, 777, new Date(Date.UTC(2026, 0, 13)).toISOString());
+  insertUsage(
+    "k2",
+    "openai",
+    "gpt-4o-mini",
+    777,
+    777,
+    new Date(Date.UTC(2026, 0, 13)).toISOString()
+  );
 
   const expected = 100 + 50 + 30 + 20;
   assert.equal(counter.seedWindowUsageFromHistory(limit, NOW_JAN), expected);
@@ -183,6 +190,86 @@ test("getCurrentWindowUsage seeds from history and PERSISTS the seed (FIX 3)", a
   assert.equal(counter.getCurrentWindowUsage(limit, NOW_JAN, true), seeded + 25);
 });
 
+test("zero-usage cold window is initialized before the first successful request", async () => {
+  const limit = tokenLimits.upsertTokenLimit({
+    apiKeyId: "k-cold-zero",
+    scopeType: "global",
+    tokenLimit: 100000,
+    resetInterval: "monthly",
+  });
+  const { windowStart } = tokenLimits.resetWindowIfElapsed(limit, NOW_JAN);
+  const db = core.getDbInstance();
+
+  assert.equal(counter.getCurrentWindowUsage(limit, NOW_JAN, true), 0);
+  const row = db
+    .prepare(
+      "SELECT tokens_used FROM api_key_token_counters WHERE limit_id = ? AND window_start = ?"
+    )
+    .get(limit.id, windowStart) as { tokens_used: number } | undefined;
+  assert.equal(row?.tokens_used, 0);
+});
+
+test("window initialization is atomic and idempotent", async () => {
+  const limit = tokenLimits.upsertTokenLimit({
+    apiKeyId: "k-init-race",
+    scopeType: "global",
+    tokenLimit: 100000,
+    resetInterval: "monthly",
+  });
+  const { windowStart } = tokenLimits.resetWindowIfElapsed(limit, NOW_JAN);
+
+  assert.equal(tokenLimits.initializeWindowTokens(limit.id, windowStart, 300), 300);
+  assert.equal(tokenLimits.initializeWindowTokens(limit.id, windowStart, 900), 300);
+  assert.equal(tokenLimits.initializeWindowTokens(limit.id, windowStart, 0), 300);
+  assert.equal(tokenLimits.getWindowUsage(limit, NOW_JAN), 300);
+});
+
+test("first successful request after zero preflight is counted exactly once", async () => {
+  const limit = tokenLimits.upsertTokenLimit({
+    apiKeyId: "k-first-success",
+    scopeType: "global",
+    tokenLimit: 100000,
+    resetInterval: "monthly",
+  });
+
+  // Policy enforcement initializes the cold window before provider dispatch.
+  assert.equal(counter.getCurrentWindowUsage(limit, Date.now(), true), 0);
+
+  // Reproduce production ordering: usage_history persistence wins the race
+  // before the fire-and-forget counter recorder executes.
+  insertUsage("k-first-success", "groq", "gpt-oss", 422, 199, new Date().toISOString(), {
+    reasoning: 187,
+  });
+  counter.recordTokenUsage("k-first-success", "groq", "gpt-oss", 808);
+  await flush();
+  await flush();
+
+  assert.equal(tokenLimits.getWindowUsage(limit, Date.now()), 808);
+
+  counter.recordTokenUsage("k-first-success", "groq", "gpt-oss", 12);
+  await flush();
+  await flush();
+  assert.equal(tokenLimits.getWindowUsage(limit, Date.now()), 820);
+});
+
+test("preflight initializes each rollover window independently", async () => {
+  const limit = tokenLimits.upsertTokenLimit({
+    apiKeyId: "k-rollover-init",
+    scopeType: "global",
+    tokenLimit: 100000,
+    resetInterval: "monthly",
+  });
+  assert.equal(counter.getCurrentWindowUsage(limit, NOW_JAN, true), 0);
+  assert.equal(counter.getCurrentWindowUsage(limit, NOW_FEB, true), 0);
+
+  const db = core.getDbInstance();
+  const rows = db
+    .prepare("SELECT window_start, tokens_used FROM api_key_token_counters WHERE limit_id = ?")
+    .all(limit.id) as Array<{ window_start: string; tokens_used: number }>;
+  assert.equal(rows.length, 2);
+  assert.ok(rows.every((row) => row.tokens_used === 0));
+});
+
 test("seed total excludes cache tokens (no double-count) (FIX 2)", async () => {
   const limit = tokenLimits.upsertTokenLimit({
     apiKeyId: "k2c",
@@ -194,11 +281,19 @@ test("seed total excludes cache tokens (no double-count) (FIX 2)", async () => {
 
   // tokens_input ALREADY INCLUDES cache_read + cache_creation (these columns are a
   // breakdown, per migration 012). Billable = input + output + reasoning ONLY.
-  insertUsage("k2c", "anthropic", "claude-sonnet", 500, 200, new Date(Date.UTC(2026, 0, 12)).toISOString(), {
-    cacheRead: 300,
-    cacheCreation: 100,
-    reasoning: 40,
-  });
+  insertUsage(
+    "k2c",
+    "anthropic",
+    "claude-sonnet",
+    500,
+    200,
+    new Date(Date.UTC(2026, 0, 12)).toISOString(),
+    {
+      cacheRead: 300,
+      cacheCreation: 100,
+      reasoning: 40,
+    }
+  );
 
   // 500 + 200 + 40 = 740. Must NOT add cacheRead/cacheCreation again (would be 1140).
   assert.equal(counter.seedWindowUsageFromHistory(limit, NOW_JAN), 740);
