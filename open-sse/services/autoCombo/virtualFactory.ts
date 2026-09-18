@@ -3,6 +3,7 @@ import { MODE_PACKS } from "./modePacks";
 import { DEFAULT_WEIGHTS, ScoringWeights } from "./scoring";
 import { AutoVariant } from "./autoPrefix";
 import { getProviderConnections } from "@/lib/db/providers";
+import { getSyncedAvailableModelsByConnection, type SyncedAvailableModel } from "@/lib/db/models";
 import { getSettings } from "@/lib/db/settings";
 import { getProviderRegistry } from "./providerRegistryAccessor";
 import type { ConnectionFields } from "@/lib/db/encryption";
@@ -264,6 +265,21 @@ export async function createVirtualAutoCombo(
 
   const validConnections = connections.filter(hasUsableConnectionCredential);
 
+  // Catalog-authority fix (2026-09-18): batch-fetch each represented
+  // provider's synced active catalog, grouped by connection, once per
+  // provider (not once per connection) so a connection that has
+  // successfully synced treats that catalog — not stale static registry
+  // metadata — as authoritative for availability. Known ghost-model example
+  // this closes: Cerebras `zai-glm-4.7` is `providerInfo.models[0]` in the
+  // static registry and would otherwise keep resurfacing here even after
+  // being removed from Cerebras's live synced catalog.
+  const syncedByProvider = new Map<string, Record<string, SyncedAvailableModel[]>>();
+  await Promise.all(
+    Array.from(new Set(validConnections.map((conn) => conn.provider))).map(async (providerId) => {
+      syncedByProvider.set(providerId, await getSyncedAvailableModelsByConnection(providerId));
+    })
+  );
+
   const candidatePool: VirtualAutoComboCandidate[] = [];
   for (const conn of validConnections) {
     // #5873: custom OpenAI-/Anthropic-compatible providers have dynamic connection
@@ -271,11 +287,26 @@ export async function createVirtualAutoCombo(
     // them from `auto/` routing — only fall back to the registry's first model when
     // the connection has no explicit defaultModel.
     const providerInfo = getProviderRegistry()[conn.provider];
+    const syncedModels = syncedByProvider.get(conn.provider)?.[conn.id];
 
-    let modelId: string | undefined = conn.defaultModel;
-    if (!modelId && providerInfo) {
-      const firstModel = providerInfo.models[0];
-      modelId = firstModel?.id;
+    let modelId: string | undefined;
+    if (syncedModels && syncedModels.length > 0) {
+      // Non-empty synced catalog is authoritative: keep defaultModel only if
+      // it's still present, otherwise fall back to the synced catalog's own
+      // first entry. Never fall through to the static registry in this branch.
+      const syncedIds = new Set(syncedModels.map((m) => m.id));
+      modelId =
+        conn.defaultModel && syncedIds.has(conn.defaultModel)
+          ? conn.defaultModel
+          : syncedModels[0].id;
+    } else {
+      // Never synced (or synced with zero models) — preserve today's
+      // static-registry bootstrap behavior exactly.
+      modelId = conn.defaultModel;
+      if (!modelId && providerInfo) {
+        const firstModel = providerInfo.models[0];
+        modelId = firstModel?.id;
+      }
     }
     if (!modelId) continue; // Skip providers without a resolvable model
 
@@ -305,7 +336,10 @@ export async function createVirtualAutoCombo(
   // `/v1/models` listing — so auto-routing never picks a model that will 402/403.
   // If this empties the pool the existing graceful empty-pool path below handles it
   // (consistent with the opt-in intent). Default OFF → pool unchanged.
-  const paidFilteredPool = filterPaidOnlyCandidates(candidatePool, settings.hidePaidModels === true);
+  const paidFilteredPool = filterPaidOnlyCandidates(
+    candidatePool,
+    settings.hidePaidModels === true
+  );
   if (paidFilteredPool !== candidatePool) {
     candidatePool.length = 0;
     candidatePool.push(...paidFilteredPool);
