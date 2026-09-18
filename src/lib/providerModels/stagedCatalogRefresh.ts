@@ -334,6 +334,29 @@ export async function runStagedCatalogRefresh(
   const authorizationImpact = await deps.checkAuthorizationImpact(providerId, diff.removedIds);
   const shadowRouting = await deps.compareShadowRouting(providerId, connectionId, stagedModels);
 
+  // Empty-catalog safety: a genuinely empty upstream fetch (fetchStatus
+  // "empty", not a rejected/malformed one -- those never reach here) must
+  // never silently wipe an existing non-empty live catalog. Direct callers
+  // of this pipeline don't get the sync-models route's own
+  // `discoveredModels.length > 0` outer guard, so this is the pipeline's own
+  // fail-closed default for that case -- same governed override as
+  // authorization impact, not a separate mechanism.
+  const isEmptyOverwrite = stageResult.entry.fetchStatus === "empty" && previousModels.length > 0;
+  if (isEmptyOverwrite && !options.forcePublishDespiteImpact) {
+    return {
+      providerId,
+      connectionId,
+      validation: { valid: true },
+      diff: diff.summary,
+      authorizationImpact,
+      shadowRouting,
+      published: false,
+      publishReason: "empty_catalog_requires_explicit_override",
+      backup: null,
+      previousModels,
+    };
+  }
+
   if (authorizationImpact.length > 0 && !options.forcePublishDespiteImpact) {
     return {
       providerId,

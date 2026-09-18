@@ -5,7 +5,9 @@ import { selectModelsForImport } from "@/shared/utils/freeModels";
 import {
   importManagedModels,
   type ManagedModelImportMode,
+  type PublishSyncedAvailableModelsFn,
 } from "@/lib/providerModels/managedModelImport";
+import { runStagedCatalogRefresh } from "@/lib/providerModels/stagedCatalogRefresh";
 import { saveCallLog } from "@/lib/usage/callLogs";
 import { isAuthenticated } from "@/shared/utils/apiAuth";
 import {
@@ -145,6 +147,31 @@ function summarizeModelChanges(previousModels: unknown, nextModels: unknown) {
     total: added + removed + updated,
   };
 }
+
+/**
+ * Routes the actual synced-available-models live write through the staged
+ * catalog-refresh pipeline (STAGE -> VALIDATE -> DIFF -> POLICY CHECK ->
+ * SHADOW ROUTING COMPARISON -> ATOMIC PUBLISH), instead of writing directly.
+ * Everything else in importManagedModels() (custom models, aliases,
+ * antigravity mitm mapping) is unaffected -- this only replaces the one
+ * decision point that used to call replaceSyncedAvailableModelsForConnection()
+ * unconditionally.
+ */
+const publishViaStagedRefresh: PublishSyncedAvailableModelsFn = async (
+  providerId,
+  connectionId,
+  discoveredModels,
+  previousSyncedAvailableModels
+) => {
+  const outcome = await runStagedCatalogRefresh(providerId, connectionId, discoveredModels);
+  return {
+    syncedAvailableModels: outcome.published ? discoveredModels : previousSyncedAvailableModels,
+    published: outcome.published,
+    publishReason: outcome.publishReason,
+    authorizationImpact: outcome.authorizationImpact,
+    backup: outcome.backup,
+  };
+};
 
 function getModelSyncChannelLabel(connection: unknown) {
   const record = asRecord(connection);
@@ -488,6 +515,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       importedModels,
       discoveredModels,
       syncedAvailableModels,
+      syncedAvailableModelsPublish,
       syncedAliases,
       importedChanges,
     } = await importManagedModels({
@@ -496,10 +524,19 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       fetchedModels,
       mode,
       previousSyncedAvailableModels: previousSyncedAvailableModelsForConnection,
+      publishSyncedAvailableModels: publishViaStagedRefresh,
     });
 
+    // Only treat `discoveredModels` as what's actually live when the staged
+    // pipeline either wasn't invoked (nothing discovered) or actually
+    // published it. When publish was withheld (authorization impact,
+    // empty-catalog safety), `syncedAvailableModels` already correctly holds
+    // the real, unchanged live state -- using `discoveredModels` here instead
+    // would report a diff/log for a write that never happened.
     const effectiveAvailableModels =
-      discoveredModels.length > 0 ? discoveredModels : syncedAvailableModels;
+      discoveredModels.length > 0 && syncedAvailableModelsPublish?.published !== false
+        ? discoveredModels
+        : syncedAvailableModels;
     const modelChanges = summarizeModelChanges(
       previousSyncedAvailableModels,
       effectiveAvailableModels
@@ -609,6 +646,22 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       logged: shouldLog,
       models: persistedModels,
       importedModels,
+      // Backward-compatible optional field: only present when the staged
+      // pipeline actually ran (i.e. discoveredModels was non-empty). Absent
+      // for every response shape existing callers already depend on.
+      ...(syncedAvailableModelsPublish
+        ? {
+            catalogPublish: {
+              published: syncedAvailableModelsPublish.published,
+              ...(syncedAvailableModelsPublish.publishReason
+                ? { reason: syncedAvailableModelsPublish.publishReason }
+                : {}),
+              ...(syncedAvailableModelsPublish.authorizationImpact?.length
+                ? { authorizationImpact: syncedAvailableModelsPublish.authorizationImpact }
+                : {}),
+            },
+          }
+        : {}),
     });
   } catch (error: any) {
     // Log error

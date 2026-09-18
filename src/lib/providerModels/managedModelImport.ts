@@ -26,6 +26,43 @@ type JsonRecord = Record<string, unknown>;
 
 export type ManagedModelImportMode = "merge" | "sync";
 
+/**
+ * Result of deciding what to persist for the connection's synced-available-models
+ * row. `published: false` means the live row was intentionally left untouched
+ * (e.g. staged-refresh gated it on authorization impact or empty-catalog
+ * safety) -- `syncedAvailableModels` in that case is the caller's own
+ * `previousSyncedAvailableModels`, unchanged.
+ */
+export interface SyncedAvailableModelsPublishOutcome {
+  syncedAvailableModels: SyncedAvailableModel[];
+  published: boolean;
+  publishReason?: string;
+  authorizationImpact?: unknown[];
+  backup?: { filename: string; size: number } | null;
+}
+
+export type PublishSyncedAvailableModelsFn = (
+  providerId: string,
+  connectionId: string,
+  discoveredModels: SyncedAvailableModel[],
+  previousSyncedAvailableModels: SyncedAvailableModel[]
+) => Promise<SyncedAvailableModelsPublishOutcome>;
+
+/** Today's exact, unmodified behavior: unconditional direct write. Used
+ *  whenever a caller doesn't supply its own `publishSyncedAvailableModels`. */
+async function defaultPublishSyncedAvailableModels(
+  providerId: string,
+  connectionId: string,
+  discoveredModels: SyncedAvailableModel[]
+): Promise<SyncedAvailableModelsPublishOutcome> {
+  const syncedAvailableModels = await replaceSyncedAvailableModelsForConnection(
+    providerId,
+    connectionId,
+    discoveredModels
+  );
+  return { syncedAvailableModels, published: true };
+}
+
 export type ManagedImportedModel = {
   id: string;
   name: string;
@@ -192,12 +229,14 @@ export async function importManagedModels({
   fetchedModels,
   mode,
   previousSyncedAvailableModels: previousSyncedAvailableModelsInput,
+  publishSyncedAvailableModels = defaultPublishSyncedAvailableModels,
 }: {
   providerId: string;
   connectionId: string;
   fetchedModels: unknown;
   mode: ManagedModelImportMode;
   previousSyncedAvailableModels?: SyncedAvailableModel[];
+  publishSyncedAvailableModels?: PublishSyncedAvailableModelsFn;
 }) {
   const previousModels = (await getCustomModels(providerId)) as JsonRecord[];
   const previousSyncedAvailableModels =
@@ -239,12 +278,15 @@ export async function importManagedModels({
   preserveRemovedCustomModelCompat(providerId, removedCustomModels);
 
   let syncedAvailableModels: SyncedAvailableModel[] = previousSyncedAvailableModels;
+  let syncedAvailableModelsPublish: SyncedAvailableModelsPublishOutcome | undefined;
   if (discoveredModels.length > 0) {
-    syncedAvailableModels = await replaceSyncedAvailableModelsForConnection(
+    syncedAvailableModelsPublish = await publishSyncedAvailableModels(
       providerId,
       connectionId,
-      discoveredModels
+      discoveredModels,
+      previousSyncedAvailableModels
     );
+    syncedAvailableModels = syncedAvailableModelsPublish.syncedAvailableModels;
   }
 
   // Prune stale/inactive connection caches for this provider
@@ -343,6 +385,7 @@ export async function importManagedModels({
     importedModels,
     discoveredModels,
     syncedAvailableModels,
+    syncedAvailableModelsPublish,
     syncedAliases,
     importedChanges,
   };

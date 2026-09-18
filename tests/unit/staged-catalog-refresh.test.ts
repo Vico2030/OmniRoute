@@ -135,6 +135,41 @@ test("a genuinely empty upstream catalog is staged (not rejected) and distinguis
   }
 });
 
+// empty-catalog safety: a genuine empty fetch must never silently wipe an
+// existing non-empty live catalog when run through the full pipeline.
+test("a genuinely empty upstream catalog does not wipe an existing non-empty live catalog by default", async () => {
+  const conn = await makeConnection();
+  await modelsDb.replaceSyncedAvailableModelsForConnection("cerebras", conn.id, [
+    { id: "gpt-oss-120b", name: "GPT OSS 120B" },
+  ]);
+
+  const result = await staged.runStagedCatalogRefresh("cerebras", conn.id, []);
+
+  assert.equal(result.published, false);
+  assert.equal(result.publishReason, "empty_catalog_requires_explicit_override");
+  const live = await modelsDb.getSyncedAvailableModelsForConnection("cerebras", conn.id);
+  assert.deepEqual(
+    live.map((m) => m.id),
+    ["gpt-oss-120b"]
+  );
+
+  // Explicit override still requires an operator opt-in -- never automatic.
+  const forced = await staged.runStagedCatalogRefresh("cerebras", conn.id, [], {
+    forcePublishDespiteImpact: true,
+  });
+  assert.equal(forced.published, true);
+  const liveAfterForce = await modelsDb.getSyncedAvailableModelsForConnection("cerebras", conn.id);
+  assert.deepEqual(liveAfterForce, []);
+});
+
+// a genuinely empty catalog when there was NOTHING live before is not an
+// "overwrite" at all -- no existing state to protect, so it publishes normally.
+test("a genuinely empty upstream catalog for a never-synced connection publishes normally (nothing to protect)", async () => {
+  const conn = await makeConnection();
+  const result = await staged.runStagedCatalogRefresh("cerebras", conn.id, []);
+  assert.equal(result.published, true);
+});
+
 // 5. explicit allowedModels impact detected
 test("removing a model referenced by an api_keys allowedModels grant is detected and blocks auto-publish", async () => {
   const conn = await makeConnection();
