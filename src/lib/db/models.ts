@@ -289,7 +289,7 @@ type SyncedAvailableModelInput = Omit<SyncedAvailableModel, "source"> & {
   source?: string;
 };
 
-function normalizeSyncedAvailableModel(model: unknown): SyncedAvailableModel | null {
+export function normalizeSyncedAvailableModel(model: unknown): SyncedAvailableModel | null {
   const record = asRecord(model);
   const id =
     toNonEmptyString(record.id) || toNonEmptyString(record.name) || toNonEmptyString(record.model);
@@ -330,7 +330,7 @@ function normalizeSyncedAvailableModel(model: unknown): SyncedAvailableModel | n
   };
 }
 
-function normalizeSyncedAvailableModels(models: unknown): SyncedAvailableModel[] {
+export function normalizeSyncedAvailableModels(models: unknown): SyncedAvailableModel[] {
   if (!Array.isArray(models)) return [];
   const deduped = new Map<string, SyncedAvailableModel>();
   for (const model of models) {

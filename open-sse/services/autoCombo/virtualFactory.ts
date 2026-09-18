@@ -239,9 +239,25 @@ export function computeAdvertisedLimits(candidates: Array<{ provider: string; mo
   return { contextLength, maxOutputTokens };
 }
 
+/**
+ * Offline shadow-comparison hook (staged catalog refresh pipeline,
+ * 2026-09-18): patches the synced-catalog read for specific
+ * (provider, connectionId) pairs on top of a live read, so a pre-publish
+ * shadow run can see what the candidate pool would look like AFTER a
+ * staged refresh, without writing anything to the live `syncedAvailableModels`
+ * table. Every provider/connection not present in the patch is read from the
+ * DB exactly as before — this is purely additive and unused (undefined) by
+ * every existing caller, so default behavior is byte-for-byte unchanged.
+ */
+export interface SyncedCatalogOverride {
+  /** providerId -> connectionId -> models, layered on top of the live read. */
+  patch: Map<string, Record<string, SyncedAvailableModel[]>>;
+}
+
 export async function createVirtualAutoCombo(
   variant: AutoVariant | undefined,
-  spec?: AutoComboSpec
+  spec?: AutoComboSpec,
+  overrides?: SyncedCatalogOverride
 ): Promise<VirtualAutoCombo> {
   const [connections, disabledNoAuthConnections, settings] = await Promise.all([
     getProviderConnections({ isActive: true }) as Promise<VirtualFactoryConn[]>,
@@ -276,7 +292,9 @@ export async function createVirtualAutoCombo(
   const syncedByProvider = new Map<string, Record<string, SyncedAvailableModel[]>>();
   await Promise.all(
     Array.from(new Set(validConnections.map((conn) => conn.provider))).map(async (providerId) => {
-      syncedByProvider.set(providerId, await getSyncedAvailableModelsByConnection(providerId));
+      const live = await getSyncedAvailableModelsByConnection(providerId);
+      const patch = overrides?.patch.get(providerId);
+      syncedByProvider.set(providerId, patch ? { ...live, ...patch } : live);
     })
   );
 
