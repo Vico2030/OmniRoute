@@ -13,6 +13,8 @@ const actionSchema = z.object({
     "clear_model_lockout",
     "reactivate_connection",
     "deactivate_connection",
+    "quarantine_model",
+    "clear_model_quarantine",
   ]),
   target: z.object({
     provider: z.string().min(1),

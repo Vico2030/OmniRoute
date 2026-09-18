@@ -30,10 +30,9 @@ import {
   looksLikeQuotaExhausted,
   type FailureKind,
 } from "../../src/shared/utils/classify429";
-import { resolveProviderId } from "../../src/shared/constants/providers";
 import { resolveUseUpstream429BreakerHints } from "../../src/shared/utils/providerHints";
-import { getCodexModelScope } from "../config/codexQuotaScopes.ts";
-import { getQuotaScopedModelForProvider } from "./antigravityQuotaFamily.ts";
+import { getModelLockKey, getCanonicalLockProvider } from "./modelLockKey.ts";
+import { isModelQuarantined } from "./modelQuarantine.ts";
 import { isRpdExhausted, isRpmExhausted } from "./geminiRateLimitTracker.ts";
 import { setConnectionRateLimitUntil } from "@/lib/db/providers";
 import { parseRetryHintFromJsonBody } from "./retryAfterJson.ts";
@@ -391,27 +390,6 @@ export async function getRuntimeProviderProfile(provider: string | null | undefi
 const modelLockouts = new Map<string, ModelLockoutEntry>();
 const modelFailureState = new Map<string, ModelFailureState>();
 
-// Aliases (e.g. "cx" → "codex") must share lockout state with their canonical
-// provider, otherwise a model locked via one spelling stays routable via the other.
-const canonicalProviderCache = new Map<string, string>();
-function getCanonicalLockProvider(provider: string): string {
-  let canonical = canonicalProviderCache.get(provider);
-  if (!canonical) {
-    canonical = resolveProviderId(provider);
-    canonicalProviderCache.set(provider, canonical);
-  }
-  return canonical;
-}
-
-function getModelLockKey(provider: string, connectionId: string, model: string) {
-  const canonicalProvider = getCanonicalLockProvider(provider);
-  const lockModel =
-    canonicalProvider === "codex"
-      ? getCodexModelScope(model)
-      : getQuotaScopedModelForProvider(canonicalProvider, model) || model;
-  return `${canonicalProvider}:${connectionId}:${lockModel}`;
-}
-
 function getFailureWindowMs(profile: ProviderProfile | null = null, fallbackMs = 30 * 60 * 1000) {
   const configured = profile?.resetTimeoutMs;
   return typeof configured === "number" && configured > 0 ? configured : fallbackMs;
@@ -738,7 +716,10 @@ export function isModelLocked(
   const key = getModelLockKey(provider, connectionId, model);
   cleanupModelLockKey(key);
   const entry = modelLockouts.get(key);
-  return Boolean(entry);
+  // A durable quarantine (modelQuarantine.ts) excludes a candidate the same way
+  // a transient lock does — same identity, same enforcement point, so every
+  // existing isModelLocked() caller (combo.ts) picks this up with no changes.
+  return Boolean(entry) || isModelQuarantined(provider, connectionId, model);
 }
 
 /**

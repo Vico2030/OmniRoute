@@ -6,8 +6,30 @@ import {
   updateProviderConnection,
 } from "@/lib/db/providers";
 import { clearProviderFailure, clearModelLock } from "@omniroute/open-sse/services/accountFallback";
+import {
+  quarantineModel,
+  clearModelQuarantine,
+  getAllModelQuarantines,
+  isModelQuarantined,
+  type ModelQuarantineReason,
+} from "@omniroute/open-sse/services/modelQuarantine";
+import {
+  checkDurableModelEligibility,
+  listCallLoggedModelsForProvider,
+} from "./durableModelEligibility";
 
 type JsonRecord = Record<string, unknown>;
+
+// 2026-09-18b correction: quarantine_model eligibility is now decided from
+// DURABLE evidence (call_logs, via durableModelEligibility.ts) — NOT from
+// whether accountFallback.ts's transient, ≤2-minute in-memory lock happens
+// to be active at the exact moment of the check. That coupling made the
+// action's own precheck timing-dependent: a model proven permanently dead by
+// repeated history could fail eligibility simply because nothing had retried
+// it in the last couple of minutes. The transient lock itself is completely
+// unchanged — it still exists, still enforces, still expires the same way —
+// this only changes what this file consults to decide whether to OFFER the
+// governed action.
 
 export type ProviderAutopilotSeverity = "info" | "warning" | "critical";
 export type ProviderAutopilotState = "healthy" | "degraded" | "down";
@@ -19,7 +41,9 @@ export type ProviderAutopilotActionType =
   | "clear_stale_connection_error"
   | "clear_model_lockout"
   | "reactivate_connection"
-  | "deactivate_connection";
+  | "deactivate_connection"
+  | "quarantine_model"
+  | "clear_model_quarantine";
 
 export interface ProviderAutopilotTarget {
   provider: string;
@@ -47,6 +71,8 @@ export interface ProviderAutopilotIssue {
     | "terminal_connection_error"
     | "inactive_connection"
     | "model_lockout"
+    | "model_quarantine"
+    | "durable_model_failure"
     | "quota_monitor_warning";
   title: string;
   recommendation: string;
@@ -70,6 +96,7 @@ export interface ProviderAutopilotProvider {
       staleErrors: number;
     };
     modelLockouts: number;
+    modelQuarantines: number;
     quotaMonitor: JsonRecord | null;
   };
   issues: ProviderAutopilotIssue[];
@@ -151,6 +178,13 @@ function stableEvidenceForHash(evidence: JsonRecord): JsonRecord {
   const stable: JsonRecord = { ...evidence };
   delete stable.remainingMs;
   delete stable.retryAfterMs;
+  // 2026-09-18b: durable-evidence windowStart/windowEnd are wall-clock query
+  // bounds derived from `now` — they shift on every report build even when
+  // the underlying evidence hasn't changed, which would otherwise make
+  // preconditionsHash mismatch spuriously. evidenceFingerprint (already
+  // excludes them — see durableModelEligibility.ts) is the stable signal.
+  delete stable.windowStart;
+  delete stable.windowEnd;
   return stable;
 }
 
@@ -274,6 +308,10 @@ export async function buildProviderHealthAutopilotReport(
     const provider = providerFromLockout(lockout);
     return provider && (!providerFilter || provider === providerFilter);
   });
+  const quarantines = (getAllModelQuarantines() as unknown as JsonRecord[]).filter((quarantine) => {
+    const provider = providerFromLockout(quarantine);
+    return provider && (!providerFilter || provider === providerFilter);
+  });
   const quotaSnapshots = quotaMonitor?.getQuotaMonitorSnapshots
     ? (quotaMonitor.getQuotaMonitorSnapshots() as JsonRecord[]).filter((snapshot) => {
         const provider = toString(snapshot.provider);
@@ -294,6 +332,10 @@ export async function buildProviderHealthAutopilotReport(
     const provider = providerFromLockout(lockout);
     if (provider) providerIds.add(provider);
   }
+  for (const quarantine of quarantines) {
+    const provider = providerFromLockout(quarantine);
+    if (provider) providerIds.add(provider);
+  }
   for (const snapshot of quotaSnapshots) {
     const provider = toString(snapshot.provider);
     if (provider) providerIds.add(provider);
@@ -306,10 +348,12 @@ export async function buildProviderHealthAutopilotReport(
       (connection) => connection.provider === provider
     );
     const breaker = breakers.find((entry) => (entry as JsonRecord).name === provider) as
-      | JsonRecord
-      | undefined;
+      JsonRecord | undefined;
     const providerLockouts = lockouts.filter(
       (lockout) => providerFromLockout(lockout) === provider
+    );
+    const providerQuarantines = quarantines.filter(
+      (quarantine) => providerFromLockout(quarantine) === provider
     );
     const providerQuota = quotaSnapshots.filter((snapshot) => snapshot.provider === provider);
     const issues: ProviderAutopilotIssue[] = [];
@@ -460,6 +504,16 @@ export async function buildProviderHealthAutopilotReport(
         connectionExists: Boolean(connection),
         terminalConnection,
       };
+      // quarantine_model is no longer offered from this transient-lockout
+      // signal directly (2026-09-18b) — see the durable_model_failure loop
+      // below, which is now the sole source of that action offer. The
+      // transient lock's own clear_model_lockout action is unaffected.
+      const lockoutActions: ProviderAutopilotAction[] = [];
+      if (includeActions && connection && !terminalConnection) {
+        lockoutActions.push(
+          action("clear_model_lockout", "Clear model lockout", "medium", target, evidence)
+        );
+      }
       issues.push({
         id: issueId("model_lockout", target),
         severity: terminalConnection || !connection ? "info" : "warning",
@@ -471,10 +525,88 @@ export async function buildProviderHealthAutopilotReport(
             : "Clear the model lockout after confirming the model quota or availability recovered.",
         target,
         evidence,
+        actions: lockoutActions,
+      });
+    }
+
+    // Durable-evidence quarantine eligibility (2026-09-18b) — reads call_logs
+    // directly, independent of whether a transient lock happens to be active
+    // right now. This is the sole source of the quarantine_model action offer.
+    const callLoggedModels = listCallLoggedModelsForProvider(provider).filter((entry) =>
+      providerConnections.some((connection) => connection.id === entry.connectionId)
+    );
+    for (const { connectionId, model } of callLoggedModels) {
+      if (isModelQuarantined(provider, connectionId, model)) continue; // already covered below
+      const connection = providerConnections.find((entry) => entry.id === connectionId);
+      const terminalConnection = connection ? isTerminalConnection(connection) : false;
+      const eligibility = checkDurableModelEligibility(provider, connectionId, model);
+      if (!eligibility.eligible) continue;
+
+      const target = { provider, connectionId, model };
+      const evidence = {
+        reason: eligibility.reason,
+        qualifyingFailureCount: eligibility.qualifyingFailureCount,
+        successCountSinceFirstFailure: eligibility.successCountSinceFirstFailure,
+        totalRequestsInWindow: eligibility.totalRequestsInWindow,
+        windowStart: eligibility.windowStart,
+        windowEnd: eligibility.windowEnd,
+        firstQualifyingFailureAt: eligibility.firstQualifyingFailureAt,
+        lastQualifyingFailureAt: eligibility.lastQualifyingFailureAt,
+        evidenceFingerprint: eligibility.evidenceFingerprint,
+        connectionExists: Boolean(connection),
+        terminalConnection,
+      };
+      issues.push({
+        id: issueId("durable_model_failure", target),
+        severity: terminalConnection || !connection ? "info" : "warning",
+        kind: "durable_model_failure",
+        title: `${model} has repeated, durable model_not_found evidence on one connection`,
+        recommendation:
+          terminalConnection || !connection
+            ? "Resolve the connection state before quarantining a model on it."
+            : "Repeated model_not_found failures with no successful completion since — consider a durable quarantine so this model stops re-entering Smart Auto regardless of the transient lock's own timing.",
+        target,
+        evidence,
         actions:
           includeActions && connection && !terminalConnection
-            ? [action("clear_model_lockout", "Clear model lockout", "medium", target, evidence)]
+            ? [
+                action(
+                  "quarantine_model",
+                  "Quarantine this model (durable, survives restart)",
+                  "medium",
+                  target,
+                  evidence
+                ),
+              ]
             : [],
+      });
+    }
+
+    for (const quarantine of providerQuarantines) {
+      const connectionId = toString(quarantine.connectionId);
+      const model = toString(quarantine.model);
+      if (!connectionId || !model) continue;
+      const connection = providerConnections.find((entry) => entry.id === connectionId);
+      const target = { provider, connectionId, model };
+      const evidence = {
+        reason: quarantine.reason ?? null,
+        source: quarantine.source ?? null,
+        quarantinedAt: quarantine.quarantinedAt ?? null,
+        modelEvidence: quarantine.evidence ?? null,
+        connectionExists: Boolean(connection),
+      };
+      issues.push({
+        id: issueId("model_quarantine", target),
+        severity: "info",
+        kind: "model_quarantine",
+        title: `${model} is durably quarantined on one connection`,
+        recommendation:
+          "Clear the quarantine if catalog/model refresh or a manual re-test shows this model is usable again for this account.",
+        target,
+        evidence,
+        actions: includeActions
+          ? [action("clear_model_quarantine", "Clear model quarantine", "medium", target, evidence)]
+          : [],
       });
     }
 
@@ -559,6 +691,9 @@ export async function buildProviderHealthAutopilotReport(
           staleErrors,
         },
         modelLockouts: providerLockouts.length,
+        // Not scored as a penalty: an active durable quarantine means a dead
+        // model was already contained, not that the provider is unstable now.
+        modelQuarantines: providerQuarantines.length,
         quotaMonitor: providerQuota.length
           ? {
               warning: providerQuota.filter((snapshot) => snapshot.status === "warning").length,
@@ -704,6 +839,68 @@ export async function executeProviderHealthAutopilotAction(
         return {
           status: 409,
           body: { success: false, error: "model lockout changed; refresh before retrying" },
+        };
+      }
+      changed = { removed };
+      break;
+    }
+    case "quarantine_model": {
+      const connectionId = toString(input.target.connectionId);
+      const model = toString(input.target.model);
+      if (!connectionId || !model) {
+        return {
+          status: 400,
+          body: { success: false, error: "connectionId and model are required" },
+        };
+      }
+      const connection = (await getProviderConnectionById(connectionId)) as JsonRecord | null;
+      if (!connection || connection.provider !== provider) {
+        return { status: 404, body: { success: false, error: "connection not found" } };
+      }
+      if (isTerminalConnection(connection)) {
+        return { status: 409, body: { success: false, error: "terminal connection state" } };
+      }
+      // 2026-09-18b: re-validated from DURABLE evidence, not the transient
+      // lock — matches what buildProviderHealthAutopilotReport() itself now
+      // consults, so a fresh report and this execution path always agree.
+      const eligibility = checkDurableModelEligibility(provider, connectionId, model);
+      if (!eligibility.eligible || !eligibility.reason) {
+        return {
+          status: 409,
+          body: {
+            success: false,
+            error: "model is not currently eligible for durable quarantine",
+          },
+        };
+      }
+      const entry = quarantineModel(provider, connectionId, model, {
+        reason: eligibility.reason as ModelQuarantineReason,
+        evidence: {
+          qualifyingFailureCount: eligibility.qualifyingFailureCount,
+          successCountSinceFirstFailure: eligibility.successCountSinceFirstFailure,
+          windowStart: eligibility.windowStart,
+          windowEnd: eligibility.windowEnd,
+          evidenceFingerprint: eligibility.evidenceFingerprint,
+        },
+        source: "health_autopilot",
+      });
+      changed = { quarantined: true, entry: entry as unknown as JsonRecord };
+      break;
+    }
+    case "clear_model_quarantine": {
+      const connectionId = toString(input.target.connectionId);
+      const model = toString(input.target.model);
+      if (!connectionId || !model) {
+        return {
+          status: 400,
+          body: { success: false, error: "connectionId and model are required" },
+        };
+      }
+      const removed = clearModelQuarantine(provider, connectionId, model);
+      if (!removed) {
+        return {
+          status: 409,
+          body: { success: false, error: "model quarantine changed; refresh before retrying" },
         };
       }
       changed = { removed };
