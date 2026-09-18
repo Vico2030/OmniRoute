@@ -193,41 +193,6 @@ export const WEB_SESSION_CREDENTIAL_REQUIREMENTS = {
     acceptsFullCookieHeader: true,
     storageKeys: ["cookie", "token", "ssxmod_itna", "ssxmod_itna2", "cna", "tongyi_sso_ticket"],
   },
-  "duckduckgo-web": {
-    kind: "cookie",
-    credentialName: "duckai",
-    placeholder: "duckai=... or full Cookie header from duckduckgo.com",
-    acceptsFullCookieHeader: true,
-    storageKeys: ["cookie", "duckai"],
-  },
-  "t3-chat-web": {
-    kind: "token",
-    credentialName: "token",
-    placeholder: "Paste your T3 Chat token from t3.chat (Local Storage → token)",
-    acceptsFullCookieHeader: false,
-    storageKeys: ["token"],
-  },
-  "chatglm-web": {
-    kind: "cookie",
-    credentialName: "chatglm_session",
-    placeholder: "chatglm_session=... or full Cookie header from chatglm.cn",
-    acceptsFullCookieHeader: true,
-    storageKeys: ["cookie", "chatglm_session"],
-  },
-  "xiaomimimo-web": {
-    kind: "cookie",
-    credentialName: "session",
-    placeholder: "session=... or full Cookie header from aistudio.xiaomimimo.com",
-    acceptsFullCookieHeader: true,
-    storageKeys: ["cookie", "session"],
-  },
-  "manus-web": {
-    kind: "cookie",
-    credentialName: "manus_session",
-    placeholder: "manus_session=... or full Cookie header from manus.im",
-    acceptsFullCookieHeader: true,
-    storageKeys: ["cookie", "manus_session"],
-  },
   "zai-web": {
     kind: "cookie",
     credentialName: "token",
@@ -297,8 +262,8 @@ export function hasUsableWebSessionCredential(
  * Resolve the value that a web-session import must store in the connection's
  * `apiKey` column.
  *
- * `token`-kind providers (deepseek-web, copilot-web, copilot-m365-web,
- * t3-chat-web, …) are authenticated from `apiKey`: both the connection
+ * `token`-kind providers (deepseek-web, copilot-web, copilot-m365-web, …)
+ * are authenticated from `apiKey`: both the connection
  * validator (`validateDeepSeekWebProvider({ apiKey })`) and the executor
  * (`extractUserToken` → `credentials.apiKey`) read the token there — never from
  * `providerSpecificData`. The bulk web-session import used to leave `apiKey`
