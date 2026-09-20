@@ -169,6 +169,8 @@ const publishViaStagedRefresh: PublishSyncedAvailableModelsFn = async (
     published: outcome.published,
     publishReason: outcome.publishReason,
     authorizationImpact: outcome.authorizationImpact,
+    diff: outcome.diff,
+    shadowRouting: outcome.shadowRouting,
     backup: outcome.backup,
   };
 };
@@ -658,6 +660,12 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
                 : {}),
               ...(syncedAvailableModelsPublish.authorizationImpact?.length
                 ? { authorizationImpact: syncedAvailableModelsPublish.authorizationImpact }
+                : {}),
+              ...(syncedAvailableModelsPublish.diff
+                ? { diff: syncedAvailableModelsPublish.diff }
+                : {}),
+              ...(syncedAvailableModelsPublish.shadowRouting
+                ? { shadowRouting: syncedAvailableModelsPublish.shadowRouting }
                 : {}),
             },
           }

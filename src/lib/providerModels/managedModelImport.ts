@@ -38,6 +38,8 @@ export interface SyncedAvailableModelsPublishOutcome {
   published: boolean;
   publishReason?: string;
   authorizationImpact?: unknown[];
+  diff?: { added: number; removed: number; unchanged: number; total: number };
+  shadowRouting?: unknown;
   backup?: { filename: string; size: number } | null;
 }
 

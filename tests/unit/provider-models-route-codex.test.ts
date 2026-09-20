@@ -189,15 +189,11 @@ test("provider models route merges live Codex models with the local catalog then
     [...modelIds].some((id) => String(id).startsWith("gpt-5.4")),
     false
   );
-  assert.ok(syncedIds.has("gpt-5.6-sol"));
-  assert.ok(syncedIds.has("gpt-5.5-low"));
-  assert.equal(
-    [...syncedIds].some((id) => String(id).startsWith("gpt-5.4")),
-    false
-  );
-  // Stale cache-only ids are replaced when a fresh discovery response is persisted.
+  // Discovery returns the fresh candidate catalog without replacing the live row.
+  assert.equal(syncedIds.has("gpt-5.6-sol"), false);
+  assert.equal(syncedIds.has("gpt-5.5-low"), false);
   assert.equal(modelIds.has("stale-codex-model"), false);
-  assert.equal(syncedIds.has("stale-codex-model"), false);
+  assert.equal(syncedIds.has("stale-codex-model"), true);
 });
 
 test("provider models route uses the GitHub Codex catalog when live discovery fails", async () => {
@@ -288,8 +284,8 @@ test("provider models route returns cached Codex models when refresh discovery f
   );
   const syncedModels = await modelsDb.getSyncedAvailableModelsForConnection("codex", connection.id);
   const syncedIds = new Set(syncedModels.map((model) => model.id));
-  assert.ok(syncedIds.has("gpt-5.6-sol-ultra"));
-  assert.equal(syncedIds.has("gpt-5.4"), false);
+  assert.equal(syncedIds.has("gpt-5.6-sol-ultra"), false);
+  assert.equal(syncedIds.has("gpt-5.4"), true);
 });
 
 test("provider models route auto-includes remote-only Codex models after merge", async () => {
@@ -335,7 +331,7 @@ test("provider models route auto-includes remote-only Codex models after merge",
   assert.ok(modelIds.has("future-codex-experimental"));
   assert.ok(modelIds.has("gpt-5.6-sol"));
   assert.equal(modelIds.has("gpt-5.4"), false);
-  assert.ok(syncedIds.has("future-codex-experimental"));
+  assert.equal(syncedIds.has("future-codex-experimental"), false);
   assert.equal(syncedIds.has("gpt-5.4"), false);
 });
 

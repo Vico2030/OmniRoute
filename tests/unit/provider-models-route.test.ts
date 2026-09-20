@@ -749,10 +749,13 @@ test("provider models route merges Upstage chat and embedding catalogs", async (
   assert.equal(modelIds.includes("document-parse"), false);
 });
 
-test("provider models route caches discovered opencode-go models per connection", async () => {
+test("provider models refresh returns fresh models without mutating the live synced catalog", async () => {
   const connection = await seedConnection("opencode-go", {
     apiKey: "opencode-go-key",
   });
+  await modelsDb.replaceSyncedAvailableModelsForConnection("opencode-go", connection.id, [
+    { id: "existing-go", name: "Existing Go", source: "imported" },
+  ]);
   let fetchCalls = 0;
 
   globalThis.fetch = async (url, init = {}) => {
@@ -765,7 +768,7 @@ test("provider models route caches discovered opencode-go models per connection"
     });
   };
 
-  const firstResponse = await callRoute(connection.id);
+  const firstResponse = await callRoute(connection.id, "?refresh=true");
   const firstBody = (await firstResponse.json()) as any;
   const cachedModels = await modelsDb.getSyncedAvailableModelsForConnection(
     "opencode-go",
@@ -775,18 +778,7 @@ test("provider models route caches discovered opencode-go models per connection"
   assert.equal(firstResponse.status, 200);
   assert.equal(firstBody.source, "api");
   assert.deepEqual(firstBody.models, [{ id: "glm-5.1", name: "GLM 5.1", owned_by: "opencode-go" }]);
-  assert.deepEqual(cachedModels, [{ id: "glm-5.1", name: "GLM 5.1", source: "imported" }]);
-
-  globalThis.fetch = async () => {
-    throw new Error("cached route should not hit upstream");
-  };
-
-  const cachedResponse = await callRoute(connection.id);
-  const cachedBody = (await cachedResponse.json()) as any;
-
-  assert.equal(cachedResponse.status, 200);
-  assert.equal(cachedBody.source, "cache");
-  assert.deepEqual(cachedBody.models, [{ id: "glm-5.1", name: "GLM 5.1", source: "imported" }]);
+  assert.deepEqual(cachedModels, [{ id: "existing-go", name: "Existing Go", source: "imported" }]);
   assert.equal(fetchCalls, 1);
 });
 
@@ -816,7 +808,7 @@ test("provider models route falls back to cached models when a refresh fails", a
   assert.equal(fetchCalls, 2);
 });
 
-test("provider models route clears cached discovery when a refresh returns no remote models", async () => {
+test("provider models route leaves cached discovery untouched when refresh returns no remote models", async () => {
   const connection = await seedConnection("opencode-go", {
     apiKey: "opencode-go-key",
   });
@@ -836,10 +828,9 @@ test("provider models route clears cached discovery when a refresh returns no re
   );
 
   assert.equal(response.status, 200);
-  assert.equal(body.source, "local_catalog");
-  assert.match(body.warning, /no remote models discovered/i);
-  assert.ok(body.models.every((model) => model.id !== "cached-go"));
-  assert.deepEqual(cachedModels, []);
+  assert.equal(body.source, "api");
+  assert.deepEqual(body.models, []);
+  assert.deepEqual(cachedModels, [{ id: "cached-go", name: "Cached Go", source: "imported" }]);
 });
 
 test("provider models route honors autoFetchModels=false and skips remote discovery", async () => {

@@ -43,6 +43,13 @@ interface SyncModelsResponseBody {
   catalogPublish?: {
     published: boolean;
     reason?: string;
+    diff?: { added: number; removed: number; unchanged: number; total: number };
+    shadowRouting?: {
+      addedModels: string[];
+      removedModels: string[];
+      defaultModelChanged: boolean;
+      requesterVisibleImpact: boolean;
+    };
     authorizationImpact?: Array<{
       modelStr: string;
       referencedByApiKeys: Array<{ id: string; name: string }>;
@@ -117,7 +124,14 @@ test("a clean sync with no authorization impact stages then publishes, and repor
 
   assert.equal(response.status, 200);
   assert.deepEqual(body.modelChanges, { added: 1, removed: 0, updated: 0, total: 1 });
-  assert.deepEqual(body.catalogPublish, { published: true });
+  assert.equal(body.catalogPublish?.published, true);
+  assert.deepEqual(body.catalogPublish?.diff, {
+    added: 1,
+    removed: 0,
+    unchanged: 0,
+    total: 1,
+  });
+  assert.equal(body.catalogPublish?.shadowRouting?.requesterVisibleImpact, true);
   assert.deepEqual(
     (await modelsDb.getSyncedAvailableModels("cerebras")).map((m) => m.id),
     ["gpt-oss-120b"]
@@ -212,6 +226,13 @@ test("removing a model an api_keys grant depends on blocks auto-publish and repo
   assert.equal(response.status, 200);
   assert.equal(body.catalogPublish.published, false);
   assert.equal(body.catalogPublish.reason, "authorization_impact_requires_explicit_override");
+  assert.deepEqual(body.catalogPublish.diff, {
+    added: 1,
+    removed: 1,
+    unchanged: 0,
+    total: 2,
+  });
+  assert.equal(body.catalogPublish.shadowRouting?.requesterVisibleImpact, true);
   assert.equal(body.catalogPublish.authorizationImpact[0].modelStr, "cerebras/gpt-oss-120b");
   // modelChanges reflects reality (nothing actually changed live), not the
   // withheld attempt -- this is the correctness fix effectiveAvailableModels

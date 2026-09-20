@@ -68,7 +68,6 @@ import {
 import {
   getCachedDiscoveredModels,
   isAutoFetchModelsEnabled,
-  persistDiscoveredModels,
 } from "@/lib/providerModels/modelDiscovery";
 import {
   parseGeminiModelsList,
@@ -406,69 +405,17 @@ export async function GET(
       warning?: string,
       extraPayload: Record<string, unknown> = {}
     ) => {
-      const discoveredModels = await persistDiscoveredModels(provider, connectionId, models);
-      if (discoveredModels.length > 0) {
-        return buildResponse({
-          provider,
-          connectionId,
-          models,
-          source: "api",
-          ...(warning ? { warning } : {}),
-          ...extraPayload,
-        });
-      }
-
-      // Empty discovery just cleared THIS connection's synced cache (via
-      // persistDiscoveredModels([])). `providerSyncedModels` was read at the top
-      // of the handler and is now stale, so it must not leak the just-cleared
-      // models back into the response (#3148 made synced authoritative for the
-      // normal path; here we re-read the current state instead). Re-derive the
-      // local catalog from the provider's remaining synced models (union across
-      // its other connections) or the static catalog when none remain.
-      let freshSynced: Awaited<ReturnType<typeof getSyncedAvailableModels>> = [];
-      try {
-        freshSynced = await getSyncedAvailableModels(provider);
-      } catch {
-        /* DB unavailable — fall through to static catalog */
-      }
-      const freshRegistry = freshSynced.length
-        ? freshSynced.map((m) => ({
-            id: m.id,
-            name: m.name || m.id,
-            ...(m.apiFormat ? { apiFormat: m.apiFormat } : {}),
-            ...(m.supportedEndpoints ? { supportedEndpoints: m.supportedEndpoints } : {}),
-          }))
-        : getModelsByProviderId(provider) || [];
-      const freshSpecialty = freshSynced.length ? [] : getStaticModelsForProvider(provider) || [];
-      const freshLocal = mergeLocalCatalogModels(freshRegistry, freshSpecialty).map((model) => ({
-        id: model.id,
-        name: model.name || model.id,
-        ...((model as Record<string, unknown>).apiFormat
-          ? { apiFormat: (model as Record<string, unknown>).apiFormat as string | undefined }
-          : {}),
-        ...((model as Record<string, unknown>).supportedEndpoints
-          ? {
-              supportedEndpoints: (model as Record<string, unknown>).supportedEndpoints as
-                string[] | undefined,
-            }
-          : {}),
-        ...(freshRegistry.length > 0 ? { owned_by: provider } : {}),
-      }));
-      if (freshLocal.length > 0) {
-        return buildResponse({
-          provider,
-          connectionId,
-          models: freshLocal,
-          source: "local_catalog",
-          warning: "No remote models discovered — using local catalog",
-        });
-      }
-
+      // Discovery is read-only. Provider-specific parsing above returns the
+      // candidate catalog; the sync route normalizes it and is the sole refresh
+      // path allowed to publish through runStagedCatalogRefresh(). Persisting
+      // here used to replace the live row before staged checks saw the diff.
       return buildResponse({
         provider,
         connectionId,
-        models: [],
+        models,
         source: "api",
+        ...(warning ? { warning } : {}),
+        ...extraPayload,
       });
     };
 
@@ -1747,16 +1694,8 @@ export async function GET(
       const finalizeCodexCatalog = (remoteModels: typeof cachedDiscoveryModels) =>
         buildCodexDiscoveryCatalog(remoteModels, staticCodexCatalog);
       const cachedCatalogModels = finalizeCodexCatalog(cachedDiscoveryModels);
-      const cachedIdsMatchFinalCatalog =
-        cachedDiscoveryModels.length === cachedCatalogModels.length &&
-        cachedDiscoveryModels.every((model, index) => model.id === cachedCatalogModels[index]?.id);
-      const persistFilteredCacheIfNeeded = async () => {
-        if (cachedIdsMatchFinalCatalog) return;
-        await persistDiscoveredModels(provider, connectionId, cachedCatalogModels);
-      };
 
       if (!refresh && cachedDiscoveryModels.length > 0) {
-        await persistFilteredCacheIfNeeded();
         return buildResponse({
           provider,
           connectionId,
@@ -1811,7 +1750,6 @@ export async function GET(
       }
 
       if (cachedDiscoveryModels.length > 0) {
-        await persistFilteredCacheIfNeeded();
         return buildResponse({
           provider,
           connectionId,
