@@ -8,6 +8,11 @@ import {
   type PublishSyncedAvailableModelsFn,
 } from "@/lib/providerModels/managedModelImport";
 import { runStagedCatalogRefresh } from "@/lib/providerModels/stagedCatalogRefresh";
+import { applyMaintenancePolicy } from "@/lib/providerModels/maintenancePolicy";
+import {
+  recordMaintenanceEvidence,
+  type MaintenanceOutcome,
+} from "@/lib/providerModels/maintenanceEvidence";
 import { saveCallLog } from "@/lib/usage/callLogs";
 import { isAuthenticated } from "@/shared/utils/apiAuth";
 import {
@@ -458,6 +463,15 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
           : {}),
       });
 
+      recordMaintenanceEvidence({
+        provider: logProvider,
+        connectionId: id,
+        ranAt: new Date().toISOString(),
+        outcome: "fetch_failed",
+        httpStatus: responseStatus,
+        reason: logError,
+      });
+
       return NextResponse.json(
         {
           error: responseError,
@@ -505,10 +519,19 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     const importFreeOnly = Boolean(
       (connection.providerSpecificData as Record<string, unknown> | undefined)?.importFreeModelsOnly
     );
-    const { models: fetchedModels, freeFilterEmpty } = selectModelsForImport(
+    const { models: freeFilteredModels, freeFilterEmpty } = selectModelsForImport(
       logProvider,
       allFetchedModels,
       importFreeOnly
+    );
+    // Provider maintenance policy (weekly self-maintenance, 2026-09-20): the
+    // one place a provider's own eligibility quirks are expressed, shared by
+    // manual and scheduled triggers alike -- see maintenancePolicy.ts. Models
+    // excluded here never reach the common staged lifecycle at all; they are
+    // not quarantined (no failure evidence exists for them).
+    const { eligible: fetchedModels, excluded: policyExcludedModels } = applyMaintenancePolicy(
+      logProvider,
+      freeFilteredModels as Array<Record<string, unknown>>
     );
     const {
       previousModels,
@@ -631,6 +654,33 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       });
     }
 
+    if (syncedAvailableModelsPublish) {
+      const outcome: MaintenanceOutcome = syncedAvailableModelsPublish.published
+        ? "published"
+        : syncedAvailableModelsPublish.publishReason === "authorization_impact_requires_explicit_override"
+          ? "blocked_authorization_impact"
+          : syncedAvailableModelsPublish.publishReason === "empty_catalog_requires_explicit_override"
+            ? "blocked_empty_catalog"
+            : syncedAvailableModelsPublish.publishReason === "validation_failed"
+              ? "validation_failed"
+              : "publish_failed";
+      recordMaintenanceEvidence({
+        provider: logProvider,
+        connectionId: id,
+        ranAt: new Date().toISOString(),
+        outcome,
+        httpStatus: 200,
+        ...(syncedAvailableModelsPublish.diff ? { diff: syncedAvailableModelsPublish.diff } : {}),
+        ...(syncedAvailableModelsPublish.authorizationImpact?.length
+          ? { authorizationImpactCount: syncedAvailableModelsPublish.authorizationImpact.length }
+          : {}),
+        ...(policyExcludedModels.length ? { policyExcludedCount: policyExcludedModels.length } : {}),
+        ...(syncedAvailableModelsPublish.publishReason
+          ? { reason: syncedAvailableModelsPublish.publishReason }
+          : {}),
+      });
+    }
+
     return NextResponse.json({
       ok: true,
       provider: logProvider,
@@ -666,6 +716,9 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
                 : {}),
               ...(syncedAvailableModelsPublish.shadowRouting
                 ? { shadowRouting: syncedAvailableModelsPublish.shadowRouting }
+                : {}),
+              ...(policyExcludedModels.length
+                ? { policyExcludedCount: policyExcludedModels.length }
                 : {}),
             },
           }

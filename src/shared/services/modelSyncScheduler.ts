@@ -279,8 +279,28 @@ export function startModelSyncScheduler(
 
   console.log(`[ModelSync] Scheduler started — interval: ${effectiveIntervalMs / 3_600_000}h`);
 
-  // Run immediately on startup (staggered by 5s to avoid startup congestion)
-  const startupDelay = setTimeout(() => runSyncCycle(trustedApiBaseUrl), 5_000);
+  // Run on startup ONLY if a full interval has actually elapsed since the
+  // last recorded cycle (or none was ever recorded). At a 24h interval a
+  // restart shortly after a real cycle was a minor, harmless extra sync; at
+  // a weekly interval it would mean re-fetching/re-publishing every
+  // provider's catalog on every restart regardless of how recently the real
+  // weekly cycle ran -- unsafe repeated publication the interval itself is
+  // supposed to prevent. The timer itself is still always scheduled
+  // (staggered by 5s, same as before) so this stays a pure decision inside
+  // the callback, not a change to whether/when a timer gets registered.
+  const startupDelay = setTimeout(async () => {
+    const lastRunIso = await getLastModelSyncTime();
+    const lastRunMs = lastRunIso ? Date.parse(lastRunIso) : NaN;
+    const dueForImmediateRun =
+      !Number.isFinite(lastRunMs) || Date.now() - lastRunMs >= effectiveIntervalMs;
+    if (!dueForImmediateRun) {
+      console.log(
+        `[ModelSync] Skipping startup cycle — last run ${lastRunIso} still within the ${effectiveIntervalMs / 3_600_000}h interval`
+      );
+      return;
+    }
+    await runSyncCycle(trustedApiBaseUrl);
+  }, 5_000);
   startupDelay.unref?.();
 
   // Codex-only: revalidate catalog only on first-start or app upgrade (not every boot).
