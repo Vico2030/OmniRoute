@@ -441,3 +441,98 @@ test("modelSyncScheduler skips empty cycles and tolerates failing sync requests"
     timers.restore();
   }
 });
+
+test("modelSyncScheduler skips the startup cycle when the last recorded run is still within the interval (weekly-safe restart)", async () => {
+  const localDb = await import("../../src/lib/localDb.ts");
+  await providersDb.createProviderConnection({
+    provider: "gemini",
+    authType: "apikey",
+    name: "Recent Auto Sync",
+    apiKey: "sk-recent",
+    providerSpecificData: { autoSync: true },
+  });
+  // Simulate a real cycle having completed 1 hour ago, well inside a 168h
+  // (weekly) interval -- a restart right now must not immediately re-run.
+  await localDb.updateSettings({
+    model_sync_last_run: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
+  });
+
+  const timers = installTimerStubs();
+  const originalFetch = globalThis.fetch;
+  // Unrelated to this test: startModelSyncScheduler() also fires a
+  // fire-and-forget Codex catalog "first-start" revalidation
+  // (codexCatalogRevalidation.ts), which probes __readiness_probe__/models
+  // on a fresh DB regardless of what this test is exercising. Filter it out,
+  // same convention model-sync-route.test.ts already uses.
+  const syncModelsFetchCalls = [];
+  globalThis.fetch = async (url) => {
+    if (String(url).includes("__readiness_probe__")) return new Response(null, { status: 404 });
+    syncModelsFetchCalls.push(url);
+    return new Response(JSON.stringify({ syncedModels: 1 }), { status: 200 });
+  };
+
+  try {
+    const scheduler = await loadScheduler("startup-bounded-recent");
+    scheduler.startModelSyncScheduler("http://127.0.0.1:5555", 168 * 60 * 60 * 1000);
+
+    // The timer is still always registered synchronously (same observable
+    // shape as before this change) -- only its callback's own decision changes.
+    assert.equal(timers.timeouts.length, 1);
+    assert.equal(timers.timeouts[0].ms, 5000);
+
+    await timers.timeouts[0].fn();
+
+    assert.equal(
+      syncModelsFetchCalls.length,
+      0,
+      "no sync-models call should fire on this restart"
+    );
+    scheduler.stopModelSyncScheduler();
+  } finally {
+    globalThis.fetch = originalFetch;
+    timers.restore();
+  }
+});
+
+test("modelSyncScheduler still runs the startup cycle once the interval has genuinely elapsed since the last recorded run", async () => {
+  const localDb = await import("../../src/lib/localDb.ts");
+  await providersDb.createProviderConnection({
+    provider: "gemini",
+    authType: "apikey",
+    name: "Stale Auto Sync",
+    apiKey: "sk-stale",
+    providerSpecificData: { autoSync: true },
+  });
+  // Last real cycle was 8 days ago -- older than a 168h (weekly) interval,
+  // so a restart right now IS due for an immediate catch-up run.
+  await localDb.updateSettings({
+    model_sync_last_run: new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString(),
+  });
+
+  const timers = installTimerStubs();
+  const originalFetch = globalThis.fetch;
+  // Same unrelated Codex "first-start" revalidation probe as the previous
+  // test -- filter it out rather than count it.
+  const syncModelsFetchCalls = [];
+  globalThis.fetch = async (url) => {
+    if (String(url).includes("__readiness_probe__")) return new Response(null, { status: 404 });
+    syncModelsFetchCalls.push(url);
+    return new Response(JSON.stringify({ syncedModels: 1 }), { status: 200 });
+  };
+
+  try {
+    const scheduler = await loadScheduler("startup-bounded-stale");
+    scheduler.startModelSyncScheduler("http://127.0.0.1:5555", 168 * 60 * 60 * 1000);
+    await timers.timeouts[0].fn();
+
+    assert.equal(
+      syncModelsFetchCalls.length,
+      1,
+      "a genuinely overdue restart must still catch up"
+    );
+    scheduler.stopModelSyncScheduler();
+  } finally {
+    globalThis.fetch = originalFetch;
+    timers.restore();
+  }
+});
